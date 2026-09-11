@@ -1,4 +1,3 @@
-version: "3.9"
 
 # ── Scientific RAG Assistant – full local stack ──────────────────────────────
 #
@@ -20,16 +19,27 @@ version: "3.9"
 #    docker compose up --build
 # ---------------------------------------------------------------------------
 
+# Docker keeps container logs forever by default; on a shared VM that
+# eventually fills the disk. Cap each container at 3 x 10 MB.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
 
   # ── PostgreSQL + pgvector ──────────────────────────────────────────────────
   db:
     image: pgvector/pgvector:pg16
     container_name: rag_pg
+    logging: *default-logging
     restart: unless-stopped
     environment:
       POSTGRES_USER:     raguser
-      POSTGRES_PASSWORD: ragpassword
+      # Set a strong POSTGRES_PASSWORD in .env on servers; applied only when the
+      # data volume is first initialised.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ragpassword}
       POSTGRES_DB:       ragdb
     ports:
       - "127.0.0.1:5732:5432"  # localhost only – not exposed publicly
@@ -46,6 +56,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: rag_redis
+    logging: *default-logging
     restart: unless-stopped
     ports:
       - "127.0.0.1:6380:6379"  # localhost only
@@ -64,13 +75,17 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: rag_api
+    logging: *default-logging
     restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
-    # port 8000 not exposed publicly — nginx proxies api.yourdomain.com → api:8000
+    # Localhost-only: the host nginx proxies api.<domain> → 127.0.0.1:8100.
+    # 8100 (not 8000) to avoid colliding with other apps on a shared VM.
+    ports:
+      - "127.0.0.1:${API_PORT:-8100}:8000"
     volumes:
       # Uploaded / pre-existing PDFs persist across container restarts
       - rag_data:/app/data
@@ -79,7 +94,7 @@ services:
       DB_HOST:     db
       DB_PORT:     5432        # internal port, NOT 5732
       DB_USER:     raguser
-      DB_PASSWORD: ragpassword
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-ragpassword}
       DB_NAME:     ragdb
 
       # ── Redis ──
@@ -106,25 +121,59 @@ services:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
         NEXT_PUBLIC_GOOGLE_CLIENT_ID: ${NEXT_PUBLIC_GOOGLE_CLIENT_ID}
     container_name: rag_frontend
+    logging: *default-logging
     restart: unless-stopped
     depends_on:
       - api
-    # port 3000 not exposed publicly — nginx proxies yourdomain.com → frontend:3000
+    # Localhost-only: the host nginx proxies <domain> → 127.0.0.1:3100.
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-3100}:3000"
 
-  # ── Nginx reverse proxy + SSL termination ─────────────────────────────────
+  # ── Nginx reverse proxy + SSL termination (opt-in) ────────────────────────
+  # Only for a dedicated VM with NO host nginx. On a VM that already runs nginx
+  # for other sites, use nginx/host/papyrus.conf instead (see DEPLOY.md) — this
+  # container would fail to bind 80/443. Enable with:
+  #   docker compose --profile docker-nginx up -d
   nginx:
+    profiles: ["docker-nginx"]
     image: nginx:alpine
     container_name: rag_nginx
+    logging: *default-logging
     restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
     volumes:
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./certbot/www:/var/www/certbot:ro   # ACME http-01 challenge webroot
       - /etc/letsencrypt:/etc/letsencrypt:ro
     depends_on:
       - api
       - frontend
+    # certbot renews certs on disk but cannot signal this container, so reload
+    # every 12 h to pick up a renewed certificate.
+    command: >
+      /bin/sh -c 'while :; do sleep 12h & wait $${!}; nginx -s reload; done &
+      nginx -g "daemon off;"'
+
+  # ── Certbot – automatic certificate renewal ──────────────────────────
+  # Wakes every 12 h; certbot only acts when a cert is within 30 days of expiry.
+  # Initial issuance is done manually once — see DEPLOY.md appendix.
+  certbot:
+    profiles: ["docker-nginx"]
+    image: certbot/certbot
+    container_name: rag_certbot
+    logging: *default-logging
+    restart: unless-stopped
+    volumes:
+      - ./certbot/www:/var/www/certbot          # rw: certbot writes the challenge
+      - /etc/letsencrypt:/etc/letsencrypt       # rw: certbot writes renewed certs
+    entrypoint: >
+      /bin/sh -c 'trap exit TERM;
+      while :; do
+        certbot renew --webroot -w /var/www/certbot --quiet;
+        sleep 12h & wait $${!};
+      done'
 
 # ── Volumes ────────────────────────────────────────────────────────────────
 volumes:
